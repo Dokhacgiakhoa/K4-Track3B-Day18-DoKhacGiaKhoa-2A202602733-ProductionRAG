@@ -61,15 +61,25 @@ def build_pipeline():
     return search, reranker
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
-    """Run single query through pipeline."""
+def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str], dict]:
+    """Run single query through pipeline with latency tracking."""
+    latencies = {}
+
+    t_search = time.perf_counter()
     results = search.search(query)
+    latencies["search_ms"] = (time.perf_counter() - t_search) * 1000
+
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
+
+    t_rerank = time.perf_counter()
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
+    latencies["rerank_ms"] = (time.perf_counter() - t_rerank) * 1000
+
     contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
 
     from config import OPENAI_API_KEY
-    if OPENAI_API_KEY and contexts:
+    t_llm = time.perf_counter()
+    if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-...") and contexts:
         try:
             from openai import OpenAI
             client = OpenAI()
@@ -84,7 +94,10 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             answer = contexts[0]
     else:
         answer = contexts[0] if contexts else "Không tìm thấy thông tin."
-    return answer, contexts
+    latencies["llm_ms"] = (time.perf_counter() - t_llm) * 1000
+    latencies["total_ms"] = latencies["search_ms"] + latencies["rerank_ms"] + latencies["llm_ms"]
+
+    return answer, contexts, latencies
 
 
 def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
@@ -92,14 +105,32 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     test_set = load_test_set()
     print(f"\n[Eval] Running {len(test_set)} queries...", flush=True)
     questions, answers, all_contexts, ground_truths = [], [], [], []
+    all_latencies = []
 
     for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker)
+        answer, contexts, l_dict = run_query(item["question"], search, reranker)
         questions.append(item["question"])
         answers.append(answer)
         all_contexts.append(contexts)
         ground_truths.append(item["ground_truth"])
-        print(f"  [{i+1}/{len(test_set)}] {item['question'][:50]}...", flush=True)
+        all_latencies.append(l_dict)
+        print(f"  [{i+1}/{len(test_set)}] ({l_dict['total_ms']:.1f}ms) {item['question'][:50]}...", flush=True)
+
+    # Print Latency Breakdown Report (Bonus +2)
+    if all_latencies:
+        avg_search = sum(l["search_ms"] for l in all_latencies) / len(all_latencies)
+        avg_rerank = sum(l["rerank_ms"] for l in all_latencies) / len(all_latencies)
+        avg_llm = sum(l["llm_ms"] for l in all_latencies) / len(all_latencies)
+        avg_total = sum(l["total_ms"] for l in all_latencies) / len(all_latencies)
+
+        print("\n" + "=" * 60)
+        print("LATENCY BREAKDOWN REPORT (Average per query)")
+        print("=" * 60)
+        print(f"  Hybrid Search:  {avg_search:>8.2f} ms ({avg_search/avg_total*100:>5.1f}%)")
+        print(f"  Reranking:      {avg_rerank:>8.2f} ms ({avg_rerank/avg_total*100:>5.1f}%)")
+        print(f"  LLM Generation: {avg_llm:>8.2f} ms ({avg_llm/avg_total*100:>5.1f}%)")
+        print(f"  Total Pipeline: {avg_total:>8.2f} ms")
+        print("=" * 60)
 
     t0 = time.time()
     print(f"\n[Eval] Running RAGAS (4 metrics × {len(test_set)} questions)...", flush=True)
